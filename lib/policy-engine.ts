@@ -3,14 +3,6 @@ import { z } from 'zod';
 /**
  * Policy Engine for configurable business rules
  * Centralizes hard-coded business logic into a tested, maintainable policy layer
- *
- * Features:
- * - Centralized business rule evaluation
- * - Typed policy contexts and decisions
- * - Priority-based rule evaluation (deny first, then allow)
- * - Rate limiting with time windows
- * - Pluggable rule system
- * - Comprehensive error handling
  */
 
 export type PolicyAction =
@@ -21,26 +13,19 @@ export type PolicyAction =
   | 'retry_operation'
   | 'impersonate_user';
 
-export type ActorRole = 'admin' | 'maintainer' | 'user' | 'guest';
-
-export interface PolicyActor {
-  id: string;
-  role: ActorRole;
-  permissions: string[];
-}
-
-export interface PolicyResource {
-  id: string;
-  type: string;
-  owner: string;
-}
-
 export interface PolicyContext {
-  actor: PolicyActor;
-  resource: PolicyResource;
+  actor: {
+    id: string;
+    role: 'admin' | 'maintainer' | 'user' | 'guest';
+    permissions: string[];
+  };
+  resource: {
+    id: string;
+    type: string;
+    owner: string;
+  };
   action: PolicyAction;
   metadata?: Record<string, unknown>;
-  timestamp?: number;
 }
 
 export interface PolicyDecision {
@@ -48,7 +33,6 @@ export interface PolicyDecision {
   reason: string;
   requiresConfirmation?: boolean;
   rateLimitRemaining?: number;
-  metadata?: Record<string, unknown>;
 }
 
 export interface PolicyRule {
@@ -59,7 +43,6 @@ export interface PolicyRule {
   action: PolicyAction;
   effect: 'allow' | 'deny';
   priority: number;
-  enabled: boolean;
 }
 
 export interface BusinessPolicy {
@@ -72,16 +55,9 @@ export interface BusinessPolicy {
   roleEscalationRequiresConfirmation: boolean;
 }
 
-export interface PolicyViolation {
-  ruleId: string;
-  ruleName: string;
-  reason: string;
-  timestamp: number;
-}
-
 export const defaultBusinessPolicy: BusinessPolicy = {
   maxAgentsPerUser: 10,
-  maxTransferAmount: '1000000', // XLM stroops
+  maxTransferAmount: '1000000', // XLM
   maxInvitesPerDay: 50,
   inviteExpiryHours: 24 * 7, // 7 days
   impersonationMaxDurationMinutes: 30,
@@ -89,21 +65,17 @@ export const defaultBusinessPolicy: BusinessPolicy = {
   roleEscalationRequiresConfirmation: true,
 };
 
-export const PolicyActorSchema = z.object({
-  id: z.string().min(1, 'Actor ID required'),
-  role: z.enum(['admin', 'maintainer', 'user', 'guest']),
-  permissions: z.array(z.string()).default([]),
-});
-
-export const PolicyResourceSchema = z.object({
-  id: z.string().min(1, 'Resource ID required'),
-  type: z.string().min(1, 'Resource type required'),
-  owner: z.string().min(1, 'Resource owner required'),
-});
-
 export const PolicyContextSchema = z.object({
-  actor: PolicyActorSchema,
-  resource: PolicyResourceSchema,
+  actor: z.object({
+    id: z.string(),
+    role: z.enum(['admin', 'maintainer', 'user', 'guest']),
+    permissions: z.array(z.string()),
+  }),
+  resource: z.object({
+    id: z.string(),
+    type: z.string(),
+    owner: z.string(),
+  }),
   action: z.enum([
     'create_agent',
     'transfer_funds',
@@ -113,42 +85,16 @@ export const PolicyContextSchema = z.object({
     'impersonate_user',
   ]),
   metadata: z.record(z.unknown()).optional(),
-  timestamp: z.number().optional(),
 });
 
-export const BusinessPolicySchema = z.object({
-  maxAgentsPerUser: z.number().positive(),
-  maxTransferAmount: z.string(),
-  maxInvitesPerDay: z.number().positive(),
-  inviteExpiryHours: z.number().positive(),
-  impersonationMaxDurationMinutes: z.number().positive(),
-  retryAttemptsMax: z.number().positive(),
-  roleEscalationRequiresConfirmation: z.boolean(),
-});
-
-/**
- * Core policy engine implementation
- * Handles rule evaluation, rate limiting, and policy decisions
- */
 class PolicyEngine {
   private policy: BusinessPolicy;
   private rules: Map<string, PolicyRule> = new Map();
   private rateLimits: Map<string, { count: number; resetTime: number }> = new Map();
-  private violationLog: PolicyViolation[] = [];
-  private maxViolationLogSize: number = 10000;
 
   constructor(policy: BusinessPolicy = defaultBusinessPolicy) {
     this.policy = policy;
-    this.validatePolicy(policy);
     this.initializeDefaultRules();
-  }
-
-  private validatePolicy(policy: BusinessPolicy): void {
-    try {
-      BusinessPolicySchema.parse(policy);
-    } catch (error) {
-      throw new Error(`Invalid business policy: ${error instanceof Error ? error.message : String(error)}`);
-    }
   }
 
   private initializeDefaultRules(): void {
@@ -160,7 +106,6 @@ class PolicyEngine {
       action: 'impersonate_user',
       effect: 'deny',
       priority: 100,
-      enabled: true,
       condition: (ctx) => ctx.actor.role !== 'admin',
     });
 
@@ -172,7 +117,6 @@ class PolicyEngine {
       action: 'escalate_role',
       effect: 'deny',
       priority: 90,
-      enabled: true,
       condition: (ctx) => {
         const isEscalation = ['admin', 'maintainer'].includes(ctx.resource.type);
         return isEscalation && !ctx.metadata?.confirmed;
@@ -187,11 +131,10 @@ class PolicyEngine {
       action: 'invite_collaborator',
       effect: 'deny',
       priority: 80,
-      enabled: true,
       condition: (ctx) => {
         const key = `invites:${ctx.actor.id}`;
         const limit = this.rateLimits.get(key);
-        return limit && limit.count >= this.policy.maxInvitesPerDay;
+        return limit ? limit.count >= this.policy.maxInvitesPerDay : false;
       },
     });
 
@@ -203,7 +146,6 @@ class PolicyEngine {
       action: 'create_agent',
       effect: 'deny',
       priority: 70,
-      enabled: true,
       condition: (ctx) => ctx.actor.role === 'guest',
     });
 
@@ -215,7 +157,6 @@ class PolicyEngine {
       action: 'create_agent',
       effect: 'deny',
       priority: 60,
-      enabled: true,
       condition: (ctx) => {
         const agentCount = (ctx.metadata?.agentCount as number) || 0;
         return agentCount >= this.policy.maxAgentsPerUser;
@@ -226,64 +167,27 @@ class PolicyEngine {
     this.addRule({
       id: 'transfer_amount_limit',
       name: 'Transfer amount limit',
-      description: `Maximum transfer amount is ${this.policy.maxTransferAmount} stroops`,
+      description: `Maximum transfer amount is ${this.policy.maxTransferAmount} XLM`,
       action: 'transfer_funds',
       effect: 'deny',
       priority: 50,
-      enabled: true,
       condition: (ctx) => {
-        try {
-          const amount = (ctx.metadata?.amount as string) || '0';
-          return BigInt(amount) > BigInt(this.policy.maxTransferAmount);
-        } catch {
-          return false;
-        }
+        const amount = (ctx.metadata?.amount as string) || '0';
+        return BigInt(amount) > BigInt(this.policy.maxTransferAmount);
       },
     });
   }
 
   addRule(rule: PolicyRule): void {
-    try {
-      // Validate rule structure
-      if (!rule.id || !rule.name || !rule.action) {
-        throw new Error('Rule must have id, name, and action');
-      }
-      this.rules.set(rule.id, rule);
-    } catch (error) {
-      throw new Error(`Failed to add rule: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    this.rules.set(rule.id, rule);
   }
 
-  removeRule(ruleId: string): boolean {
-    return this.rules.delete(ruleId);
-  }
-
-  disableRule(ruleId: string): boolean {
-    const rule = this.rules.get(ruleId);
-    if (!rule) return false;
-    rule.enabled = false;
-    return true;
-  }
-
-  enableRule(ruleId: string): boolean {
-    const rule = this.rules.get(ruleId);
-    if (!rule) return false;
-    rule.enabled = true;
-    return true;
-  }
-
-  getRule(ruleId: string): PolicyRule | undefined {
-    return this.rules.get(ruleId);
+  removeRule(ruleId: string): void {
+    this.rules.delete(ruleId);
   }
 
   updatePolicy(updates: Partial<BusinessPolicy>): void {
-    try {
-      const newPolicy = { ...this.policy, ...updates };
-      this.validatePolicy(newPolicy);
-      this.policy = newPolicy;
-    } catch (error) {
-      throw new Error(`Failed to update policy: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    this.policy = { ...this.policy, ...updates };
   }
 
   getPolicy(): Readonly<BusinessPolicy> {
@@ -298,36 +202,28 @@ class PolicyEngine {
       return {
         allowed: false,
         reason: 'Invalid policy context',
-        metadata: {
-          validationError: error instanceof Error ? error.message : String(error),
-        },
       };
     }
 
-    const timestamp = context.timestamp || Date.now();
-    const contextWithTimestamp = { ...context, timestamp };
-
     // Sort rules by priority (higher first)
-    const sortedRules = Array.from(this.rules.values())
-      .filter((r) => r.enabled)
-      .sort((a, b) => b.priority - a.priority);
+    const sortedRules = Array.from(this.rules.values()).sort(
+      (a, b) => b.priority - a.priority
+    );
 
-    // Evaluate deny rules first (fail-secure)
+    // Evaluate deny rules first
     const denyRules = sortedRules.filter((r) => r.effect === 'deny' && r.action === context.action);
     for (const rule of denyRules) {
-      if (rule.condition(contextWithTimestamp)) {
-        this.logViolation(rule.id, rule.name, rule.description);
+      if (rule.condition(context)) {
         return {
           allowed: false,
           reason: rule.description,
-          metadata: { violatedRuleId: rule.id },
         };
       }
     }
 
     // Evaluate allow rules
     const allowRules = sortedRules.filter((r) => r.effect === 'allow' && r.action === context.action);
-    const allowed = allowRules.length === 0 || allowRules.some((r) => r.condition(contextWithTimestamp));
+    const allowed = allowRules.length === 0 || allowRules.some((r) => r.condition(context));
 
     if (!allowed) {
       return {
@@ -343,13 +239,12 @@ class PolicyEngine {
 
     const rateLimitKey = `${context.action}:${context.actor.id}`;
     const rateLimitInfo = this.rateLimits.get(rateLimitKey);
-    const rateLimitRemaining = this.getActionLimit(context.action) - (rateLimitInfo?.count || 0);
 
     return {
       allowed: true,
       reason: 'Policy allows this action',
       requiresConfirmation,
-      rateLimitRemaining: Math.max(0, rateLimitRemaining),
+      rateLimitRemaining: this.policy.maxInvitesPerDay - (rateLimitInfo?.count || 0),
     };
   }
 
@@ -370,10 +265,7 @@ class PolicyEngine {
     }
   }
 
-  getRateLimitStatus(
-    actorId: string,
-    action: PolicyAction
-  ): { remaining: number; resetTime: number; isLimited: boolean } {
+  getRateLimitStatus(actorId: string, action: PolicyAction): { remaining: number; resetTime: number } {
     const key = `${action}:${actorId}`;
     const limit = this.rateLimits.get(key);
     const now = Date.now();
@@ -382,15 +274,12 @@ class PolicyEngine {
       return {
         remaining: this.getActionLimit(action),
         resetTime: now + 24 * 60 * 60 * 1000,
-        isLimited: false,
       };
     }
 
-    const remaining = this.getActionLimit(action) - limit.count;
     return {
-      remaining: Math.max(0, remaining),
+      remaining: this.getActionLimit(action) - limit.count,
       resetTime: limit.resetTime,
-      isLimited: remaining <= 0,
     };
   }
 
@@ -404,34 +293,6 @@ class PolicyEngine {
       impersonate_user: 5,
     };
     return limits[action] || 0;
-  }
-
-  private logViolation(ruleId: string, ruleName: string, reason: string): void {
-    const violation: PolicyViolation = {
-      ruleId,
-      ruleName,
-      reason,
-      timestamp: Date.now(),
-    };
-
-    this.violationLog.push(violation);
-
-    // Keep log bounded
-    if (this.violationLog.length > this.maxViolationLogSize) {
-      this.violationLog = this.violationLog.slice(-this.maxViolationLogSize);
-    }
-  }
-
-  getViolationLog(): PolicyViolation[] {
-    return [...this.violationLog];
-  }
-
-  clearViolationLog(): void {
-    this.violationLog = [];
-  }
-
-  getRules(): PolicyRule[] {
-    return Array.from(this.rules.values());
   }
 }
 
@@ -448,15 +309,4 @@ export function updateBusinessPolicy(updates: Partial<BusinessPolicy>): void {
 
 export function getBusinessPolicy(): Readonly<BusinessPolicy> {
   return policyEngine.getPolicy();
-}
-
-export function recordRateLimitedAction(actorId: string, action: PolicyAction): void {
-  policyEngine.recordRateLimitedAction(actorId, action);
-}
-
-export function getRateLimitStatus(
-  actorId: string,
-  action: PolicyAction
-): { remaining: number; resetTime: number; isLimited: boolean } {
-  return policyEngine.getRateLimitStatus(actorId, action);
 }
